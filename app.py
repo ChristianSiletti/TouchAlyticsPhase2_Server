@@ -15,17 +15,21 @@ app = Flask(__name__)
 
 # Constants
 MIN_STROKES = 50    # minimum number of touch strokes
-TOUCH_ELEMENTS = 14 # Number of elements per touch
+TOUCH_ELEMENTS = 18 # Number of elements per touch
 USER_ID_FILE = "users.csv"  # File that contains the user ids
 MODEL_FILE = "touch_model.pkl"  # File that contains the knn model
 # Features required in the swipe authentication request
 REQUIRED_FEATURES = [
+    "averageAcceleration",
+    "averageDeceleration",
     "averageDirection",
     "averageVelocity",
+    "curvature",
     "directionEndToEnd",
     "maxVelocity",
     "midStrokeArea",
     "midStrokePressure",
+    "minVelocity",
     "pairwiseVelocityPercentile",
     "startX",
     "startY",
@@ -33,6 +37,7 @@ REQUIRED_FEATURES = [
     "stopY",
     "strokeDuration",
     "touchArea",
+    "trajectoryLength",
     "userID"
 ]
 
