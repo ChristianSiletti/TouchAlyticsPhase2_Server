@@ -8,6 +8,18 @@ from datetime import datetime, timedelta
 import socket
 import json
 
+
+mydb = mysql.connector.connect(
+    host="localhost",
+    user="TouchAlytics",
+    password="Touchgroup1!",
+    database="touchalytics"
+)
+
+mycursor = mydb.cursor()
+
+
+
 HOST = "0.0.0.0"
 PORT = 7000
 
@@ -20,41 +32,54 @@ conn, addr = server.accept()
 print(f"Connected by: {addr}")
 
 while True:
-    data = conn.recv(4096)  # adjust buffer size if needed
+    data = conn.recv(4096)
     if not data:
         break
 
-    # Decode UTF-8
-    text = data.decode('utf-8').strip()  # strip removes accidental newlines
+    text = data.decode('utf-8').strip()
     if not text:
         continue
 
     try:
         features = json.loads(text)
-        print("Received Features:")
-        for key, value in features.items():
-            print(f"{key}: {value}")
+        print("Received Features:", features)
+
+        # ---------- Insert into MySQL ----------
+        sql = """
+        INSERT INTO swipefeatures
+        (userID, strokeDuration, midStrokeArea, midStrokePress, dirEndToEnd, aveDir,
+        aveVelo, pairwiseVeloPercent, startX, stopX, startY, stopY)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        vals = (
+            features.get("userID"),
+            features.get("strokeDuration"),
+            features.get("midStrokeArea"),
+            features.get("midStrokePressure"),
+            features.get("directionEndToEnd"),
+            features.get("averageDirection"),
+            features.get("averageVelocity"),
+            features.get("pairwiseVelocityPercentile"),
+            features.get("startX"),
+            features.get("stopX"),
+            features.get("startY"),
+            features.get("stopY")
+        )
+
+        mycursor.execute(sql, vals)
+        mydb.commit()
+        print("Inserted into MySQL successfully.")
+
+        # Send acknowledgment to client
+        response = json.dumps({"status": "received"})
+        conn.sendall(response.encode('utf-8'))
+
     except json.JSONDecodeError as e:
         print("JSON decode error:", e)
-        print("Raw data received:", text)
-
-    # Send acknowledgment
-    response = json.dumps({"status": "received"})
-    conn.sendall(response.encode('utf-8'))
+        print("Raw data:", text)
+    except mysql.connector.Error as e:
+        print("MySQL error:", e)
 
 conn.close()
 server.close()
-
-mydb = mysql.connector.connect(
-    host="localhost",
-    user="TouchAlytics",
-    password="Touchgroup1!",
-    database="touchalytics"
-)
-
-
-
-
-mycursor = mydb.cursor()
-
-
+mydb.close()
