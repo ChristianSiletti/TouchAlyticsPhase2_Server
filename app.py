@@ -9,8 +9,10 @@ from flask import Flask, request, jsonify
 import pickle
 import os
 
-app = Flask(__name__)
+from auth import auth, listen
 
+app = Flask(__name__)
+app.register_blueprint(auth)
 # ------------------------------ CONSTANTS --------------------------
 
 # Constants

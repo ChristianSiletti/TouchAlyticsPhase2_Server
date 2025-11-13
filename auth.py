@@ -3,7 +3,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import mysql.connector
-from flask import Flask, render_template, request, redirect, url_for, session, flash
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, Blueprint
 import random
 import os
 from authlib.integrations.flask_client import OAuth  # pip install flask requests authlib
@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import socket
 import json
+
+auth = Blueprint("auth", __name__)
+
 
 
 mydb = mysql.connector.connect(
@@ -21,6 +24,8 @@ mydb = mysql.connector.connect(
 )
 
 mycursor = mydb.cursor()
+
+token = str(random.randint(100000, 999999))
 
 def SendEmail(email,body,sub):
     # creates SMTP session
@@ -42,27 +47,13 @@ def SendEmail(email,body,sub):
 def is_valid_email(email):
     return "@" in email and "." in email
 
-#TODO: Need to fix the below function to send to android. Currently fails to connect
-def sendToAndroid(token):
-    host = "128.153.220.233"  # Replace with the server's IP address
-    port = 4000  # Same port as the server
-
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((host, port))
-
-    # Send data
-    message = token
-    client_socket.send(message.encode())
-
-    # Receive acknowledgment
-    response = client_socket.recv(1024).decode()
-    print(f"Server response: {response}")
-
-    client_socket.close()
+@auth.route("/get_token")
+def sendToAndroid():
+    listen()
+    return jsonify({"token": token})
 
 
 def listen():
-    global token
     HOST = "0.0.0.0"
     PORT = 7000
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -76,7 +67,6 @@ def listen():
     text = data.decode('utf-8').strip()
 
     if (is_valid_email(text)):
-        token = str(random.randint(100000, 999999))
         emailMess = (
                         "To complete your registration for your EE368Project account please use the following verification code.\n\n"
                         "Verification Code: ") + token + (
@@ -138,7 +128,5 @@ def listen():
         mydb.close()
     conn.close()
     server.close()
-    sendToAndroid(token)
+    # sendToAndroid(token)
     print(token)
-
-listen()
