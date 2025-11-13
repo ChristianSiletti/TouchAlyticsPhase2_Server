@@ -203,7 +203,8 @@ def create_model():
 def authenticate(user_id):
     # Parse JSON
     req = request.get_json()
-    print(req)
+
+    # print(req)
 
     if not req:
         print("Invalid JSON")
@@ -213,7 +214,6 @@ def authenticate(user_id):
     features = []
     for key in REQUIRED_FEATURES:
         if key not in req:
-            print(key)
             return jsonify(
                 {"message": f"Invalid features provided: missing '{key}'"},
             ), 400
@@ -244,7 +244,6 @@ def authenticate(user_id):
         try:
             create_model()
         except NeedMultipleUsers as e:
-            print("More Users")
             return jsonify({
                 "match": "false",
                 "message": f"Need more users: {str(e)}"
@@ -256,7 +255,6 @@ def authenticate(user_id):
                 "message": f"Could not train model: {str(e)}"
             }), 503
         except Exception as e:
-            print("This is bad" + str(e))
             return jsonify({
                 "match": "false",
                 "message": f"Error while training model: {str(e)}"
