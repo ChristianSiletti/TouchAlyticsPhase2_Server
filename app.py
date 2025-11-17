@@ -9,20 +9,15 @@ from flask import Flask, request, jsonify
 import pickle
 import os
 
+from auth import auth, listen
+
 app = Flask(__name__)
-
-
-class NeedMultipleUsers(Exception):
-    """Raised when only one user is found"""
-    pass
-
-
-
+app.register_blueprint(auth)
 # ------------------------------ CONSTANTS --------------------------
 
 # Constants
 MIN_STROKES = 50    # minimum number of touch strokes
-TOUCH_ELEMENTS = 31 # Number of elements per touch
+TOUCH_ELEMENTS = 26 # Number of elements per touch
 USER_ID_FILE = "users.csv"  # File that contains the user ids
 MODEL_FILE = "touch_model.pkl"  # File that contains the knn model
 # Features required in the swipe authentication request
@@ -31,12 +26,10 @@ REQUIRED_FEATURES = [
     "averageAcceleration",
     "averageDeceleration",
     "averageDirection",
-    "averageTouchArea",
     "averageVelocity",
     "curvature",
     "directionEndToEnd",
     "initPressure",
-    "maxIdleTime",
     "maxPressure",
     "maxVelocity",
     "midStrokeArea",
@@ -50,14 +43,11 @@ REQUIRED_FEATURES = [
     "startY",
     "stopX",
     "stopY",
-    "straightnessRatio",
     "strokeDuration",
     "touchArea",
     "trajectoryLength",
     "userID",
-    "velocityVariance",
-    "xdis",
-    "ydis"
+    "velocityVariance"
 ]
 
 # -------------------------- FUNCTIONS ------------------------------
@@ -86,7 +76,6 @@ def get_curr_users(appdata):
 
     useridlist = []
 
-    appdata
     # Get each userID
     for ID in appdata.keys():
         # Filter users with enough touch strokes
@@ -95,7 +84,7 @@ def get_curr_users(appdata):
 
     # Check if only one valid user is detected
     if len(useridlist) <= 1:
-        raise NeedMultipleUsers
+        raise ValueError
 
     return useridlist
 
@@ -121,78 +110,89 @@ def measure_svm_accuracy(X,y):
     print(f"\nClassification Report:\n{classification_report(y_test, y_pred)}")
 
 
+
 def create_model():
     # Read data from the database
     ref = db.reference('/')
+
+    # Data is a dictionary of user id keys, with values of a dictionaries with keys of
+    # touch stroke ids, with values of dictionaries of each touch stroke data component
     data = ref.get()
 
-    print(data)
+    # print(len(data))
+    # print(data)
 
     # Check if any data exists in the database
-    if not data:
-        print("No data")
-        raise ValueError("No data available in Firebase to train model.")
+    if data is None:
+        try:
+            # Delete the previous users just in case
+            os.remove(USER_ID_FILE)
+        except FileNotFoundError:
+            print("File No longer exists")
+
+        raise ImportError
 
     # Get the list of previous users
     prevUsers = get_prev_users(USER_ID_FILE)
 
-    # Get the list of current users (may raise NeedMultipleUsers)
+    # Get the list of current users
     userIDlist = get_curr_users(data)
 
-    # If no change in users AND a valid model file already exists, nothing to do
-    if (
-        set(userIDlist) == set(prevUsers)
-        and os.path.exists(MODEL_FILE)
-        and os.path.getsize(MODEL_FILE) > 0
-    ):
-        return None  # model is already up to date
+    # Check if any new users were added
+    if set(userIDlist) != set(prevUsers):
+        # Remake the model if new users exist
 
-    # Remake the model
-    X = np.array([])
-    y = np.array([])
+        # Initialize valid data into X
+        X = np.array([])
 
-    # Feature order for X: all REQUIRED_FEATURES except "userID"
-    feature_keys = [k for k in REQUIRED_FEATURES if k != "userID"]
+        # Initialize valid output data into y
+        y = np.array([])
 
-    # Open a csv file to keep track of users
-    with open(USER_ID_FILE, "w") as file:
+        # Open a csv file to keep track of users
+        file = open(USER_ID_FILE, "w")
+
+        # Total touch count across all valid users
         touchIDCount = 0
+
+        # Organize the input and output data into X and y
 
         # Cycle through each user id
         for userID in userIDlist:
+            # Write the user to the csv
             file.write(f"{userID},")
             # Break down touchID dictionary
             for touchID in data[userID].keys():
-                touchIDCount += 1
-                stroke = data[userID][touchID]
+                touchIDCount = touchIDCount + 1
 
-                # Label: userID for this stroke
-                y = np.append(y, stroke["userID"])
+                # Reset the element counter
+                elmCount = 1
 
-                # Features: all keys except "userID", in REQUIRED_FEATURES order
-                for key in feature_keys:
-                    X = np.append(X, stroke[key])
+                # Break down information on touch dictionary
+                for info in data[userID][touchID].keys():
+                    if elmCount % TOUCH_ELEMENTS == 0:
+                        # Store the info in y
+                        y = np.append(y, data[userID][touchID][info])
+                    else:
+                        # Store the info in X
+                        X = np.append(X, data[userID][touchID][info])
+                    # Increment the element counter
+                    elmCount = elmCount + 1
 
-    if touchIDCount == 0:
-        print("No valid data")
-        raise ValueError("No valid touch data to train model.")
+        # Close the csv file
+        file.close()
 
-    # Reshape X: one row per touch, one column per feature (excluding userID)
-    X = X.reshape(touchIDCount, len(feature_keys))
+        # Reshape X
+        X = X.reshape(touchIDCount, TOUCH_ELEMENTS - 1)
 
-    # Evaluate SVM accuracy
-    measure_svm_accuracy(X, y)
+        # Make a svm model and measure its accuracy
+        measure_svm_accuracy(X, y)
 
-    # Create the full SVM model
-    h1 = svm.LinearSVC(C=1)
-    h1.fit(X, y)
+        # Create the full SVM model
+        h1 = svm.LinearSVC(C=1)
+        h1.fit(X, y)
 
-    # Save the model
-    with open(MODEL_FILE, 'wb') as f:
-        pickle.dump(h1, f)
-
-    return h1
-
+        # Save the model
+        pickle.dump(h1, open(MODEL_FILE, 'wb'))
 
 
 
@@ -204,89 +204,46 @@ def authenticate(user_id):
     # Parse JSON
     req = request.get_json()
 
-    # print(req)
-
     if not req:
-        print("Invalid JSON")
         return jsonify({"message": "Invalid or missing JSON body"}), 400
 
-    # Validate and collect features in order
+
+    # Validate features
     features = []
     for key in REQUIRED_FEATURES:
         if key not in req:
-            return jsonify(
-                {"message": f"Invalid features provided: missing '{key}'"},
-            ), 400
+            return jsonify({"message": f"Invalid features provided: missing '{key}'"}), 400
+        # Add feature to list
         features.append(req[key])
-
-    # Extract current user ID from the correct position
-    user_index = REQUIRED_FEATURES.index("userID")
-    currUser = features[user_index]
-    del features[user_index]  # remove userID from the feature vector
 
     # Get the list of previous users
     prevUsers = get_prev_users(USER_ID_FILE)
 
-    # Decide if we need to rebuild the model
-    need_rebuild = False
+    currUser = features[TOUCH_ELEMENTS-1]
 
-    # No previous users -> definitely need to build model
+    del features[TOUCH_ELEMENTS-1]
+
     if len(prevUsers) == 0:
-        need_rebuild = True
-    # New user not seen in prevUsers -> rebuild model
-    elif currUser not in prevUsers:
-        need_rebuild = True
-    # Model file missing or empty -> rebuild model
-    elif (not os.path.exists(MODEL_FILE)) or (os.path.getsize(MODEL_FILE) == 0):
-        need_rebuild = True
-
-    if need_rebuild:
         try:
+            # Attempt to create model
             create_model()
-        except NeedMultipleUsers as e:
-            return jsonify({
-                "match": "false",
-                "message": f"Need more users: {str(e)}"
-            }), 400
-        except ValueError as e:
-            # e.g. no data / no valid touches
-            return jsonify({
-                "match": "false",
-                "message": f"Could not train model: {str(e)}"
-            }), 503
-        except Exception as e:
-            return jsonify({
-                "match": "false",
-                "message": f"Error while training model: {str(e)}"
-            }), 503
+        except ValueError:
+            return jsonify({"match": "true", "message": "Matched"}), 200
+    else:
+        # Check if its not a new user
+        if currUser not in prevUsers:
+            # Remake model
+            create_model()
 
-    # At this point we expect a valid, non-empty MODEL_FILE
-    if not os.path.exists(MODEL_FILE) or os.path.getsize(MODEL_FILE) == 0:
-        return jsonify({
-            "match": "false",
-            "message": "Model file missing or empty"
-        }), 503
+    # Load the model
+    h1 = pickle.load(open(MODEL_FILE, 'rb'))
 
-    # Load the model safely
-    try:
-        with open(MODEL_FILE, "rb") as f:
-            h1 = pickle.load(f)
-    except EOFError:
-        return jsonify({
-            "match": "false",
-            "message": "Model file is corrupted (EOF)"
-        }), 503
-    except Exception as e:
-        return jsonify({
-            "match": "false",
-            "message": f"Error loading model: {str(e)}"
-        }), 503
+    # Reshape the features list into a numpy
+    x_input = np.array(features).reshape(1,-1)
 
-    # Reshape the features list into a numpy array for prediction
-    x_input = np.array(features).reshape(1, -1)
-
-    # Predict with the loaded model
     y_pred = h1.predict(x_input)
+
+    # print(y_pred)
 
     if y_pred == currUser:
         matched = "true"
@@ -295,9 +252,9 @@ def authenticate(user_id):
         matched = "false"
         message = "Not Matched"
 
+    # print(matched,message)
+
     return jsonify({"match": matched, "message": message}), 200
-
-
 
 
 
