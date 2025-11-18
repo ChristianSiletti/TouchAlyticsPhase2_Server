@@ -1,4 +1,8 @@
 # Imports
+from datetime import datetime, timedelta
+from collections import defaultdict
+from threading import Lock
+
 import numpy as np
 import pandas as pd
 from sklearn import model_selection, svm
@@ -59,6 +63,19 @@ REQUIRED_FEATURES = [
     "xdis",
     "ydis"
 ]
+
+# Alert thresholds
+ALERT_TIME_WINDOW = 10 #seconds
+MIN_FAILED_ATTEMPTS = 3
+
+# Track failed authentication attempts per user
+# Format: {user_id: [(timestamp1, matched), (timestamp2, matched), ...]}
+user_attempts = defaultdict(list)
+attempts_lock = Lock()
+
+# Track if alert has been sent recently to avoid spam
+# Format: {user_id: last_alert_timestamp}
+last_alert_sent = {}
 
 # -------------------------- FUNCTIONS ------------------------------
 
@@ -198,6 +215,58 @@ def create_model():
 
 # -------------------------------------------------------------------
 
+def check_failed_attempts(user_id, matched):
+    """
+    Track authentication attempts and trigger email alert if threshold is exceeded
+    :param user_id: The user ID being authenticated
+    :param matched: Boolean indicating if authentication succeeded
+    :return: Boolean indicating if an alert was triggered
+    """
+    current_time = datetime.now()
+
+    with attempts_lock:
+        # Add current attempt
+        user_attempts[user_id].append((current_time, matched))
+
+        # Remove attempts older than the time window
+        cutoff_time = current_time - timedelta(seconds = ALERT_TIME_WINDOW)
+        user_attempts[user_id] = [
+            (timestamp, match) for timestamp, match in user_attempts[user_id]
+            if timestamp > cutoff_time
+        ]
+
+        # Count failed attempts in the time window
+        failed_attempts = [
+            match for timestamp, match in user_attempts[user_id]
+            if not match
+        ]
+
+        failed_count = len(failed_attempts)
+        total_attempts = len(user_attempts[user_id])
+
+        print(f"User {user_id}: {failed_count} failed out of {total_attempts} attempts in last {ALERT_TIME_WINDOW}s")
+
+        # Check if we should send an alert
+        if failed_count >= MIN_FAILED_ATTEMPTS:
+            # Check if we haven't sent an alert recently (within last 60 seconds)
+            last_alert = last_alert_sent.get(user_id)
+            if last_alert is None or (current_time - last_alert).total_seconds() > 60:
+                # Print alert message instead of sending email
+                print("\n" + "=" * 60)
+                print("⚠️  SECURITY ALERT - EMAIL WOULD BE SENT")
+                print("=" * 60)
+                print(f"User ID: {user_id}")
+                print(f"Failed Attempts: {failed_count}")
+                print(f"Time Window: {ALERT_TIME_WINDOW} seconds")
+                print(f"Timestamp: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("=" * 60 + "\n")
+
+                last_alert_sent[user_id] = current_time
+                # Clear attempts after triggering alert
+                user_attempts[user_id] = []
+                return True
+
+        return False
 
 @app.route('/authenticate/<user_id>', methods=['POST'])
 def authenticate(user_id):
@@ -295,6 +364,8 @@ def authenticate(user_id):
         matched = "false"
         message = "Not Matched"
 
+    check_failed_attempts(currUser, matched)
+    
     return jsonify({"match": matched, "message": message}), 200
 
 
