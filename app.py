@@ -13,8 +13,11 @@ from flask import Flask, request, jsonify
 import pickle
 import os
 
+from auth import auth
+
 app = Flask(__name__)
 
+app.register_blueprint(auth)
 
 class NeedMultipleUsers(Exception):
     """Raised when only one user is found"""
