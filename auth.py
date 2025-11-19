@@ -59,6 +59,7 @@ def is_valid_email(email):
 @auth.route("/listen")
 def listen():
     global received_email
+    received_email = False
     HOST = "0.0.0.0"
     PORT = 7000
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
