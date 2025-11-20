@@ -146,7 +146,7 @@ def create_model():
     ref = db.reference('/')
     data = ref.get()
 
-    print(data)
+    # print(data)
 
     # Check if any data exists in the database
     if not data:
@@ -390,7 +390,7 @@ if __name__ == "__main__":
         # Do nothing
         print()
 
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
 
 
 
