@@ -32,6 +32,9 @@ token = str(random.randint(100000, 999999))
 HOST = "0.0.0.0"
 PORT = 7000  # must match Android SERVER_PORT
 
+# Max number of swipe feature rows to store per user
+MAX_SWIPEFEATURE_ROWS_PER_USER = 90  # e.g., 30 + 40 + 20
+
 
 # ------------------- Helper functions --------------
 
@@ -88,10 +91,28 @@ def socket_server():
 
                     print("[SOCKET] Raw received:", repr(text))
 
-                    # ───────── CASE 1: plain email (registration: check existence in userinfo) ─────────
-                    if is_valid_email(text) and "|" not in text:
-                        email = text
-                        print("[SOCKET] Registration email received:", email)
+                    # ───────── CASE 1: "email|flag" (registration / forgot password) ─────────
+                    # Android now sends: "<email>|<flag>" where flag is "exists" or "dne"
+                    if "|" in text and not text.startswith(("STORE|", "CHECK|", "UPDATE|", "FCOUNT|", "FSTORE|")):
+
+                        try:
+                            email_part, mode = text.split("|", 1)
+                        except ValueError:
+                            print("[SOCKET] Malformed email/flag payload:", text)
+                            resp = json.dumps({"status": "error", "message": "bad_payload"})
+                            conn.sendall(resp.encode("utf-8"))
+                            continue
+
+                        email = email_part.strip()
+                        mode = mode.strip().lower()
+
+                        if not is_valid_email(email):
+                            print("[SOCKET] Invalid email format in email/flag payload:", email)
+                            resp = json.dumps({"status": "error", "message": "bad_email"})
+                            conn.sendall(resp.encode("utf-8"))
+                            continue
+
+                        print(f"[SOCKET] Email/flag payload received: email={email!r}, mode={mode!r}")
 
                         try:
                             # Check if email already exists in userinfo
@@ -101,31 +122,50 @@ def socket_server():
 
                             if exists:
                                 print("[SOCKET] Email already exists in userinfo:", email)
-                                resp = json.dumps({"status": "exists"})
-                                conn.sendall(resp.encode('utf-8'))
+
+                                # Forgot-password flow: only send email when client asked for "exists"
+                                if mode == "exists":
+                                    # Make a NEW token every time we send an email
+                                    token = str(random.randint(100000, 999999))
+                                    emailMess = (
+                                        "You requested to reset your TouchAlytics password.\n\n"
+                                        f"Verification Code: {token}\n\n\n"
+                                        "If you did not request this, you can ignore this email."
+                                    )
+                                    SendEmail(email, emailMess, f"Password Reset Verification - [{token}]")
+                                    print("[SOCKET] Sent password reset token:", token)
+
+                                # Android forgot-password treats "exists" as the good path
+                                resp = json.dumps({"status": "exists", "token": int(token)})
+                                conn.sendall(resp.encode("utf-8"))
+
                             else:
-                                print("[SOCKET] New email, sending verification token:", email)
+                                print("[SOCKET] New email, candidate for registration:", email)
 
-                                emailMess = (
-                                    "To complete your registration for your EE368Project account please use the following verification code.\n\n"
-                                    f"Verification Code: {token}\n\n\n"
-                                    "If you are not trying to register this email address, please ignore this."
-                                )
-                                SendEmail(email, emailMess, f"Email Verification - [{token}]")
-                                print("[SOCKET] Sent email token:", token)
+                                # Registration flow: only send email when client asked for "dne"
+                                if mode == "dne":
+                                    token = str(random.randint(100000, 999999))
+                                    emailMess = (
+                                        "To complete your registration for your EE368Project account "
+                                        "please use the following verification code.\n\n"
+                                        f"Verification Code: {token}\n\n\n"
+                                        "If you are not trying to register this email address, "
+                                        "please ignore this."
+                                    )
+                                    SendEmail(email, emailMess, f"Email Verification - [{token}]")
+                                    print("[SOCKET] Sent registration email token:", token)
 
-                                # Send status + token back to Android
+                                # Android registration treats "ok" as the good path
                                 resp = json.dumps({"status": "ok", "token": int(token)})
-                                conn.sendall(resp.encode('utf-8'))
+                                conn.sendall(resp.encode("utf-8"))
 
                         except mysql.connector.Error as e:
                             print("[SOCKET] MySQL error during email existence check:", e)
                             resp = json.dumps({"status": "error", "message": "db_error"})
-                            conn.sendall(resp.encode('utf-8'))
+                            conn.sendall(resp.encode("utf-8"))
 
                         continue
 
-                    # ───────── CASE 2: STORE credentials "STORE|email|passwordHash|deviceId" ─────────
                     # ───────── CASE 2: STORE credentials "STORE|email|passwordHash|deviceId" ─────────
                     if text.startswith("STORE|"):
                         parts = text.split("|", 4)
@@ -243,64 +283,254 @@ def socket_server():
 
                         continue
 
-                    # ───────── CASE 4: assume JSON swipe features ─────────
-                    try:
-                        features = json.loads(text)
-                        print("[SOCKET] Received Features JSON:", features)
+                    # ───────── CASE 4: UPDATE password "UPDATE|email|passwordHash|deviceId" ─────────
+                    if text.startswith("UPDATE|"):
+                        parts = text.split("|", 4)
+                        if len(parts) == 4:
+                            _, email, hashed_password, device_id = parts
 
-                        sql = """
-                        INSERT INTO swipefeatures
-                        (userID, strokeDuration, midStrokeArea, midStrokePress, dirEndToEnd, aveDir,
-                         aveVelo, pairwiseVeloPercent, startX, stopX, startY, stopY, touchArea, maxVelo, 
-                         minVelo, accel, decel, trajLength, curvature, veloVariance, angleChangeRate, maxPress,
-                         minPress, initPress, pressChangeRate, pressVariance) 
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s,
+                            print("[SOCKET] UPDATE request received:")
+                            print("   email:          ", email)
+                            print("   hashed_password:", hashed_password)
+                            print("   device_id:      ", device_id)
+
+                            try:
+                                # 1) Fetch current password hash for this email
+                                sql = "SELECT password FROM userinfo WHERE email = %s LIMIT 1"
+                                mycursor.execute(sql, (email,))
+                                row = mycursor.fetchone()
+
+                                if row is None:
+                                    print("[SOCKET] UPDATE requested for non-existent email:", email)
+                                    resp = json.dumps({
+                                        "status": "error",
+                                        "message": "no_such_email"
+                                    })
+                                    conn.sendall(resp.encode("utf-8"))
+                                    continue
+
+                                current_hash = row[0]
+
+                                # 2) Compare hashes
+                                if current_hash == hashed_password:
+                                    print("[SOCKET] UPDATE password matches existing password for:", email)
+                                    resp = json.dumps({
+                                        "status": "error",
+                                        "message": "Cannot use most current password!"
+                                    })
+                                    conn.sendall(resp.encode("utf-8"))
+                                    continue
+
+                                # 3) Update the stored password
+                                update_sql = "UPDATE userinfo SET password = %s WHERE email = %s"
+                                mycursor.execute(update_sql, (hashed_password, email))
+                                mydb.commit()
+
+                                print("[SOCKET] Password updated for:", email)
+                                resp = json.dumps({"status": "ok"})
+                                conn.sendall(resp.encode("utf-8"))
+
+                            except mysql.connector.Error as e:
+                                print("[SOCKET] MySQL error during UPDATE:", e)
+                                resp = json.dumps({
+                                    "status": "error",
+                                    "message": "db_error"
+                                })
+                                conn.sendall(resp.encode("utf-8"))
+
+                        else:
+                            print("[SOCKET] Malformed UPDATE payload:", text)
+                            resp = json.dumps({"status": "error", "message": "bad_payload"})
+                            conn.sendall(resp.encode("utf-8"))
+
+                        continue
+
+                    # ───────── CASE 5: FCOUNT|<userID>  (return total stored swipes) ─────────
+                    if text.startswith("FCOUNT|"):
+                        parts = text.split("|", 1)
+                        if len(parts) != 2:
+                            print("[SOCKET] Malformed FCOUNT payload:", text)
+                            # Send "0" so Android treats it as incomplete training
+                            conn.sendall(b"0")
+                            continue
+
+                        raw_user_id = parts[1].strip()
+                        try:
+                            user_id = int(raw_user_id)
+                        except ValueError:
+                            print("[SOCKET] Invalid userID in FCOUNT payload:", raw_user_id)
+                            conn.sendall(b"0")
+                            continue
+
+                        try:
+                            count_sql = "SELECT COUNT(*) FROM swipefeatures WHERE userID = %s"
+                            mycursor.execute(count_sql, (user_id,))
+                            row = mycursor.fetchone()
+                            total_count = int(row[0]) if row and row[0] is not None else 0
+                            print(f"[SOCKET] FCOUNT for userID {user_id}: {total_count}")
+                            conn.sendall(str(total_count).encode("utf-8"))
+                        except mysql.connector.Error as e:
+                            print("[SOCKET] MySQL error during FCOUNT:", e)
+                            # On error, send "0" so Android sees it as not enough training
+                            conn.sendall(b"0")
+
+                        continue
+
+
+                    # ───────── CASE 6: FSTORE|<json swipe features> ─────────
+                    if text.startswith("FSTORE|"):
+                        _, json_str = text.split("|", 1)
+                        try:
+                            features = json.loads(json_str)
+                            print("[SOCKET] Received Features JSON via FSTORE:", features)
+
+                            # Expect JSON keys that MATCH DB column names:
+                            # userID, strokeDuration, midStrokeArea, midStrokePress,
+                            # dirEndToEnd, aveDir, aveVelo, pairwiseVeloPercent,
+                            # startX, startY, stopX, stopY, touchArea,
+                            # maxVelo, minVelo, accel, decel, trajLength,
+                            # curvature, veloVariance, angleChangeRate,
+                            # maxPress, minPress, initPress, pressChangeRate,
+                            # pressVariance, maxIdleTime, straightnessRatio,
+                            # xDisplacement, yDisplacement, aveTouchArea
+
+                            # ---- Extract userID and enforce per-user cap ----
+                            try:
+                                user_id = int(features.get("userID", -1))
+                            except (TypeError, ValueError):
+                                user_id = -1
+
+                            if user_id <= 0:
+                                print("[SOCKET] FSTORE payload missing/invalid userID:", features.get("userID"))
+                                resp = json.dumps({"status": "error", "message": "bad_user_id"})
+                                conn.sendall(resp.encode("utf-8"))
+                                continue
+
+                            try:
+                                mycursor.execute(
+                                    "SELECT COUNT(*) FROM swipefeatures WHERE userID = %s",
+                                    (user_id,)
+                                )
+                                row_cnt = mycursor.fetchone()
+                                current_count = int(row_cnt[0]) if row_cnt and row_cnt[0] is not None else 0
+                                print(
+                                    f"[SOCKET] FSTORE current swipefeatures count for user {user_id}: {current_count}")
+
+                                if current_count >= MAX_SWIPEFEATURE_ROWS_PER_USER:
+                                    print(
+                                        f"[SOCKET] Cap reached for user {user_id}: "
+                                        f"{current_count} >= {MAX_SWIPEFEATURE_ROWS_PER_USER}, skipping insert."
+                                    )
+                                    resp = json.dumps({
+                                        "status": "features_ignored_cap_reached",
+                                        "userID": user_id,
+                                        "count": current_count,
+                                        "cap": MAX_SWIPEFEATURE_ROWS_PER_USER,
+                                    })
+                                    conn.sendall(resp.encode("utf-8"))
+                                    continue
+
+                            except mysql.connector.Error as e:
+                                print("[SOCKET] MySQL error while checking swipefeatures cap:", e)
+                                resp = json.dumps({"status": "error", "message": "db_error"})
+                                conn.sendall(resp.encode("utf-8"))
+                                continue
+
+                            # ---- Under cap: proceed to insert this stroke ----
+                            sql = """
+                            INSERT INTO swipefeatures (
+                                userID,
+                                strokeDuration,
+                                midStrokeArea,
+                                midStrokePress,
+                                dirEndToEnd,
+                                aveDir,
+                                aveVelo,
+                                pairwiseVeloPercent,
+                                startX,
+                                startY,
+                                stopX,
+                                stopY,
+                                touchArea,
+                                maxVelo,
+                                minVelo,
+                                accel,
+                                decel,
+                                trajLength,
+                                curvature,
+                                veloVariance,
+                                angleChangeRate,
+                                maxPress,
+                                minPress,
+                                initPress,
+                                pressChangeRate,
+                                pressVariance,
+                                maxIdleTime,
+                                straightnessRatio,
+                                xDisplacement,
+                                yDisplacement,
+                                aveTouchArea
+                            ) VALUES (
                                 %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, 
-                                %s, %s)
-                        """
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s
+                            )
+                            """
 
-                        vals = (
-                            features.get("userID"),
-                            features.get("strokeDuration"),
-                            features.get("midStrokeArea"),
-                            features.get("midStrokePressure"),
-                            features.get("directionEndToEnd"),
-                            features.get("averageDirection"),
-                            features.get("averageVelocity"),
-                            features.get("pairwiseVelocityPercentile"),
-                            features.get("startX"),
-                            features.get("stopX"),
-                            features.get("startY"),
-                            features.get("stopY"),
-                            features.get("touchArea"),
-                            features.get("maxVelo"),
-                            features.get("minVelo"),
-                            features.get("aveAccel"),
-                            features.get("aveDecel"),
-                            features.get("trajLength"),
-                            features.get("curvature"),
-                            features.get("veloVariance"),
-                            features.get("angleChangeRate"),
-                            features.get("maxPress"),
-                            features.get("minPress"),
-                            features.get("initPress"),
-                            features.get("pressChangeRate"),
-                            features.get("pressVariance"),
-                        )
+                            vals = (
+                                features.get("userID"),
+                                features.get("strokeDuration"),
+                                features.get("midStrokeArea"),
+                                features.get("midStrokePress"),
+                                features.get("dirEndToEnd"),
+                                features.get("aveDir"),
+                                features.get("aveVelo"),
+                                features.get("pairwiseVeloPercent"),
+                                features.get("startX"),
+                                features.get("startY"),
+                                features.get("stopX"),
+                                features.get("stopY"),
+                                features.get("touchArea"),
+                                features.get("maxVelo"),
+                                features.get("minVelo"),
+                                features.get("accel"),
+                                features.get("decel"),
+                                features.get("trajLength"),
+                                features.get("curvature"),
+                                features.get("veloVariance"),
+                                features.get("angleChangeRate"),
+                                features.get("maxPress"),
+                                features.get("minPress"),
+                                features.get("initPress"),
+                                features.get("pressChangeRate"),
+                                features.get("pressVariance"),
+                                features.get("maxIdleTime"),
+                                features.get("straightnessRatio"),
+                                features.get("xDisplacement"),
+                                features.get("yDisplacement"),
+                                features.get("aveTouchArea"),
+                            )
 
-                        mycursor.execute(sql, vals)
-                        mydb.commit()
-                        print("[SOCKET] Inserted features into MySQL successfully.")
+                            mycursor.execute(sql, vals)
+                            mydb.commit()
+                            print("[SOCKET] Inserted features into swipefeatures successfully.")
 
-                        resp = json.dumps({"status": "features_received"})
-                        conn.sendall(resp.encode('utf-8'))
+                            resp = json.dumps({"status": "features_received"})
+                            conn.sendall(resp.encode("utf-8"))
 
-                    except json.JSONDecodeError as e:
-                        print("[SOCKET] JSON decode error:", e)
-                        print("[SOCKET] Raw data:", text)
-                    except mysql.connector.Error as e:
-                        print("[SOCKET] MySQL error:", e)
+                        except json.JSONDecodeError as e:
+                            print("[SOCKET] JSON decode error in FSTORE:", e)
+                            print("[SOCKET] Raw data:", json_str)
+                            resp = json.dumps({"status": "error", "message": "bad_json"})
+                            conn.sendall(resp.encode("utf-8"))
+
+                        except mysql.connector.Error as e:
+                            print("[SOCKET] MySQL error inserting features:", e)
+                            resp = json.dumps({"status": "error", "message": "db_error"})
+                            conn.sendall(resp.encode("utf-8"))
+
+                        continue
 
             except Exception as e:
                 print("[SOCKET] Handler error:", e)
