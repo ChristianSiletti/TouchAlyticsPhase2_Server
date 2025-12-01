@@ -368,14 +368,39 @@ def socket_server():
                             row = mycursor.fetchone()
                             total_count = int(row[0]) if row and row[0] is not None else 0
                             print(f"[SOCKET] FCOUNT for userID {user_id}: {total_count}")
+
+                            # ── NEW: if this user has reached the per-user cap, try to (re)build the model ──
+                            if total_count == MAX_SWIPEFEATURE_ROWS_PER_USER:
+                                print(
+                                    f"[SOCKET] User {user_id} reached "
+                                    f"{MAX_SWIPEFEATURE_ROWS_PER_USER} strokes; attempting model rebuild..."
+                                )
+                                try:
+                                    # Lazy import to avoid circular import at module load time
+                                    from app import create_model, NeedMultipleUsers
+                                    try:
+                                        create_model()
+                                        print("[SOCKET] Model retrained successfully after user reached cap.")
+                                    except NeedMultipleUsers:
+                                        # Not enough users with ≥ MIN_STROKES yet; safe to ignore
+                                        print(
+                                            "[SOCKET] Not enough fully-trained users "
+                                            "to build model yet (NeedMultipleUsers)."
+                                        )
+                                    except Exception as e:
+                                        print("[SOCKET] Error while retraining model from FCOUNT:", e)
+                                except ImportError as e:
+                                    print("[SOCKET] Could not import create_model from app:", e)
+
+                            # Send the count back to Android
                             conn.sendall(str(total_count).encode("utf-8"))
+
                         except mysql.connector.Error as e:
                             print("[SOCKET] MySQL error during FCOUNT:", e)
                             # On error, send "0" so Android sees it as not enough training
                             conn.sendall(b"0")
 
                         continue
-
 
                     # ───────── CASE 6: FSTORE|<json swipe features> ─────────
                     if text.startswith("FSTORE|"):
