@@ -1,15 +1,74 @@
-Created By: Christian Siletti and Clint Grano
+To run TouchAlytics with a MySQL backend, you first need a MySQL server running on localhost (default port 3306) and a database named touchalytics. After installing MySQL (or using an existing instance), create a dedicated MySQL user account that the Flask app will use. From the MySQL command line or a GUI like MySQL Workbench, connect as a privileged user (often root) and create the application user and database. A typical setup looks like this:
 
-The model was trained using a minimum of 50 swipes from each new user. The method we utilized to train the model was SVM.
-Once 50 swipes have been recorded, the model will then begin to make predictions as to what user is currently swiping, and determine if the predition and actual match. 
-The model is typically has 50%-80% accuracy, however it is very heavily influenced by the uniqueness of the users' swiping pattern. To determine the accuracy the model takes the data and splits it into a training and testing set, split 80:20 respectively. It trains the model based off the 80%, and then tests the model based off the 20%. It then compares the predicted values from the 20% testing and compares them with the actual training values, and returns a report on the models accuracy.
-The model only retrains when new users are added or deleted, otherwise it just loads the same model each time.
-For every swipe that a user makes, the connection is authenticated and either a valid or an error message is sent to the terminal.
-When there is only 1 user present, it returns all swipes as a match due to the model having no other users to compare to.
-Some issues that our model encountered were that when no users are in the firebase database, the first user's ID can not be 1, otherwise the database will glitch when trying to read the data into the model.  
-It is integral that the Flask program is running for any touch validation to occur.
+CREATE DATABASE touchalytics CHARACTER SET utf8mb3;
 
-Resources Used:
-https://scikit-learn.org/stable/modules/svm.html
-https://www.geeksforgeeks.org/flask-tutorial/
+CREATE USER 'TouchAlytics'@'localhost' IDENTIFIED BY 'Touchgroup1!';
 
+GRANT ALL PRIVILEGES ON touchalytics.* TO 'TouchAlytics'@'localhost';
+
+FLUSH PRIVILEGES;
+
+
+With the database and user created, select the touchalytics database and create the tables in the correct order. The userinfo table must be created first because the swipefeatures table has a foreign key that references userinfo.userID. Still inside MySQL with the touchalytics database selected (via USE touchalytics;), run:
+
+CREATE TABLE userinfo (
+  userID int NOT NULL AUTO_INCREMENT,
+  email varchar(255) NOT NULL,
+  password varchar(255) NOT NULL,
+  deviceID varchar(255) NOT NULL,
+  PRIMARY KEY (userID)
+) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb3;
+
+
+Once userinfo exists, you can create the swipefeatures table that stores all of the numeric swipe features extracted from the Android app. Each row corresponds to a single swipe associated with a given user via the userID foreign key. Execute:
+
+CREATE TABLE swipefeatures (
+  userID int NOT NULL,
+  strokeDuration decimal(30,16) DEFAULT NULL,
+  midStrokeArea decimal(30,16) DEFAULT NULL,
+  midStrokePress decimal(30,16) DEFAULT NULL,
+  dirEndToEnd decimal(30,16) DEFAULT NULL,
+  aveDir decimal(30,16) DEFAULT NULL,
+  aveVelo decimal(30,16) DEFAULT NULL,
+  pairwiseVeloPercent decimal(30,16) DEFAULT NULL,
+  startX decimal(30,16) DEFAULT NULL,
+  startY decimal(30,16) DEFAULT NULL,
+  stopX decimal(30,16) DEFAULT NULL,
+  stopY decimal(30,16) DEFAULT NULL,
+  touchArea decimal(30,16) DEFAULT NULL,
+  maxVelo decimal(30,16) DEFAULT NULL,
+  minVelo decimal(30,16) DEFAULT NULL,
+  accel decimal(30,16) DEFAULT NULL,
+  decel decimal(30,16) DEFAULT NULL,
+  trajLength decimal(30,16) DEFAULT NULL,
+  curvature decimal(30,16) DEFAULT NULL,
+  veloVariance decimal(30,16) DEFAULT NULL,
+  angleChangeRate decimal(30,16) DEFAULT NULL,
+  maxPress decimal(30,16) DEFAULT NULL,
+  minPress decimal(30,16) DEFAULT NULL,
+  initPress decimal(30,16) DEFAULT NULL,
+  pressChangeRate decimal(30,16) DEFAULT NULL,
+  pressVariance decimal(30,16) DEFAULT NULL,
+  maxIdleTime decimal(30,16) DEFAULT NULL,
+  straightnessRatio decimal(30,16) DEFAULT NULL,
+  xDisplacement decimal(30,16) DEFAULT NULL,
+  yDisplacement decimal(30,16) DEFAULT NULL,
+  aveTouchArea decimal(30,16) DEFAULT NULL,
+  KEY fk_swipefeatures_user (userID),
+  CONSTRAINT fk_swipefeatures_user FOREIGN KEY (userID) REFERENCES userinfo (userID) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3;
+
+
+After this, the MySQL side is ready and you can link it to your TouchAlytics backend. The project uses mysql.connector to connect to this database.
+The following code can help clarify connections.
+
+auth = Blueprint("auth", __name__)
+
+# ------------------- MySQL setup -------------------
+mydb = mysql.connector.connect(
+    host="localhost",
+    user="TouchAlytics",
+    password="Touchgroup1!",
+    database="touchalytics"
+)
+mycursor = mydb.cursor()
