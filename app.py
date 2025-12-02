@@ -1,200 +1,310 @@
 # Imports
+from datetime import datetime, timedelta
+from collections import defaultdict
+from threading import Lock
+
 import numpy as np
 import pandas as pd
 from sklearn import model_selection, svm
 from sklearn.metrics import accuracy_score, classification_report
-import firebase_admin
-from firebase_admin import credentials, db
 from flask import Flask, request, jsonify
 import pickle
 import os
 
+from auth import auth, mydb, SendEmail    # <-- MySQL connection, blueprint, and email sending function
+
+
 app = Flask(__name__)
+app.register_blueprint(auth)
+
+
+class NeedMultipleUsers(Exception):
+    """Raised when only one user is found with enough strokes."""
+    pass
+
 
 # ------------------------------ CONSTANTS --------------------------
 
-# Constants
-MIN_STROKES = 50    # minimum number of touch strokes
-TOUCH_ELEMENTS = 26 # Number of elements per touch
-USER_ID_FILE = "users.csv"  # File that contains the user ids
-MODEL_FILE = "touch_model.pkl"  # File that contains the knn model
-# Features required in the swipe authentication request
+MIN_STROKES = 90      # minimum number of touch strokes per user
+TOUCH_ELEMENTS = 31   # elements per touch (kept for reference)
+MODEL_FILE = "touch_model.pkl"  # File that contains the SVM model
+
+# Alert thresholds
+ALERT_TIME_WINDOW = 10  # seconds
+MIN_FAILED_ATTEMPTS = 3
+ALERT_EMAIL_COOLDOWN = 300  # seconds (5 minutes between alert emails per user)
+
+
+# DB table name for swipe features
+SWIPE_TABLE = "swipefeatures"
+
+# Features required in the swipe authentication request AND
+# the columns we read from the DB. This matches the swipefeatures table.
 REQUIRED_FEATURES = [
-    "angleChangeRate",
-    "averageAcceleration",
-    "averageDeceleration",
-    "averageDirection",
-    "averageVelocity",
-    "curvature",
-    "directionEndToEnd",
-    "initPressure",
-    "maxPressure",
-    "maxVelocity",
+    "userID",
+    "strokeDuration",
     "midStrokeArea",
-    "midStrokePressure",
-    "minPressure",
-    "minVelocity",
-    "pairwiseVelocityPercentile",
-    "pressureChangeRate",
-    "pressureVariance",
+    "midStrokePress",
+    "dirEndToEnd",
+    "aveDir",
+    "aveVelo",
+    "pairwiseVeloPercent",
     "startX",
     "startY",
     "stopX",
     "stopY",
-    "strokeDuration",
     "touchArea",
-    "trajectoryLength",
-    "userID",
-    "velocityVariance"
+    "maxVelo",
+    "minVelo",
+    "accel",
+    "decel",
+    "trajLength",
+    "curvature",
+    "veloVariance",
+    "angleChangeRate",
+    "maxPress",
+    "minPress",
+    "initPress",
+    "pressChangeRate",
+    "pressVariance",
+    "maxIdleTime",
+    "straightnessRatio",
+    "xDisplacement",
+    "yDisplacement",
+    "aveTouchArea",
 ]
+
+# Alert thresholds
+ALERT_TIME_WINDOW = 10  # seconds
+MIN_FAILED_ATTEMPTS = 3
+
+# Track failed authentication attempts per user
+# Format: {user_id: [(timestamp1, matched_bool), (timestamp2, matched_bool), ...]}
+user_attempts = defaultdict(list)
+attempts_lock = Lock()
+
+# Track if alert has been sent recently to avoid spam
+# Format: {user_id: last_alert_timestamp}
+last_alert_sent = {}
+
 
 # -------------------------- FUNCTIONS ------------------------------
 
-# Retrieves the list of previous users from filename
-def get_prev_users(filename):
-    try:
-        # Read the previous users from the users.csv file
-        with open(filename, "r") as ifile:
-            prevUsers = ifile.read()
 
-            # Split the csv contents
-            prevUsers = prevUsers.split(",")
+def measure_svm_accuracy(X, y):
+    """Train/test split and print SVM accuracy + reports."""
+    X_train, X_test, y_train, y_test = model_selection.train_test_split(
+        X, y, test_size=0.2, random_state=2
+    )
 
-            # Delete the last blank user
-            del prevUsers[-1]
-    # Exception for if the file is not found
-    except FileNotFoundError:
-        prevUsers = []
-
-    return prevUsers
-
-# Gets the current users from the data
-# Raises an exception if one user is detected
-def get_curr_users(appdata):
-
-    useridlist = []
-
-    # Get each userID
-    for ID in appdata.keys():
-        # Filter users with enough touch strokes
-        if len(appdata[ID]) >= MIN_STROKES:
-            useridlist.append(ID)
-
-    # Check if only one valid user is detected
-    if len(useridlist) <= 1:
-        raise ValueError
-
-    return useridlist
-
-
-def measure_svm_accuracy(X,y):
-    # Train and Test sets
-    X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.2, random_state=2)
-
-    # Create the measured model
     h1 = svm.LinearSVC(C=1)  # SVM model
-
-    # h1 = KNeighborsClassifier(n_neighbors = 3) # KNN model
     h1.fit(X_train, y_train)
 
-    # Make predictions
     y_pred = h1.predict(X_test)
 
-    # Print the accuracy of the model
     print(f"Prediction Accuracy: {accuracy_score(y_test, y_pred) * 100:.2f}%")
-
-    # Additional Accuracy Data
     print(f"\nCrosstab Table:\n{pd.crosstab(y_test, y_pred)}")
     print(f"\nClassification Report:\n{classification_report(y_test, y_pred)}")
 
 
+def load_swipe_rows_from_db():
+    """
+    Load all strokes from the DB as a list of dicts.
+    Uses a dictionary cursor so we can access by column name.
+    """
+    cursor = mydb.cursor(dictionary=True)
+
+    # Select all the columns we know we need (REQUIRED_FEATURES)
+    cols = ", ".join(REQUIRED_FEATURES)
+    query = f"SELECT {cols} FROM {SWIPE_TABLE}"
+
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    return rows
+
 
 def create_model():
-    # Read data from the database
-    ref = db.reference('/')
+    """
+    Build/refresh the SVM model using swipe feature rows from the DB (swipefeatures).
+    Applies MIN_STROKES per user and requires at least 2 such users.
+    This function no longer uses users.csv or any prev/current user tracking.
+    """
 
-    # Data is a dictionary of user id keys, with values of a dictionaries with keys of
-    # touch stroke ids, with values of dictionaries of each touch stroke data component
-    data = ref.get()
+    # 1. Read data from the database
+    rows = load_swipe_rows_from_db()
 
-    # print(len(data))
-    # print(data)
+    if not rows:
+        print("No data in DB")
+        raise ValueError("No data available in DB to train model.")
 
-    # Check if any data exists in the database
-    if data is None:
+    # 2. Group strokes by userID and enforce MIN_STROKES
+    user_to_strokes = defaultdict(list)
+
+    for row in rows:
+        # row is a dict with keys matching REQUIRED_FEATURES
+        uid_raw = row["userID"]
         try:
-            # Delete the previous users just in case
-            os.remove(USER_ID_FILE)
-        except FileNotFoundError:
-            print("File No longer exists")
+            uid = int(uid_raw)
+        except Exception:
+            uid = str(uid_raw)
 
-        raise ImportError
+        user_to_strokes[uid].append(row)
 
-    # Get the list of previous users
-    prevUsers = get_prev_users(USER_ID_FILE)
+    userIDlist = [uid for uid, strokes in user_to_strokes.items()
+                  if len(strokes) >= MIN_STROKES]
 
-    # Get the list of current users
-    userIDlist = get_curr_users(data)
+    if len(userIDlist) <= 1:
+        print(f"Found {len(userIDlist)} user(s) with >= {MIN_STROKES} strokes")
+        raise NeedMultipleUsers
 
-    # Check if any new users were added
-    if set(userIDlist) != set(prevUsers):
-        # Remake the model if new users exist
+    # 3. Build X, y
+    # Feature order for X: all REQUIRED_FEATURES except "userID"
+    feature_keys = [k for k in REQUIRED_FEATURES if k != "userID"]
 
-        # Initialize valid data into X
-        X = np.array([])
+    X_list = []
+    y_list = []
 
-        # Initialize valid output data into y
-        y = np.array([])
+    touchIDCount = 0
 
-        # Open a csv file to keep track of users
-        file = open(USER_ID_FILE, "w")
+    for uid in userIDlist:
+        for stroke in user_to_strokes[uid]:
+            touchIDCount += 1
 
-        # Total touch count across all valid users
-        touchIDCount = 0
+            # Label: userID for this stroke
+            y_list.append(uid)
 
-        # Organize the input and output data into X and y
+            # Features in REQUIRED_FEATURES order (excluding userID)
+            row_vals = [stroke[key] for key in feature_keys]
+            X_list.append(row_vals)
 
-        # Cycle through each user id
-        for userID in userIDlist:
-            # Write the user to the csv
-            file.write(f"{userID},")
-            # Break down touchID dictionary
-            for touchID in data[userID].keys():
-                touchIDCount = touchIDCount + 1
+    if touchIDCount == 0:
+        print("No valid strokes found for selected users")
+        raise ValueError("No valid touch data to train model.")
 
-                # Reset the element counter
-                elmCount = 1
+    # Convert to numpy arrays
+    X = np.array(X_list, dtype=float)
+    y = np.array(y_list)
 
-                # Break down information on touch dictionary
-                for info in data[userID][touchID].keys():
-                    if elmCount % TOUCH_ELEMENTS == 0:
-                        # Store the info in y
-                        y = np.append(y, data[userID][touchID][info])
-                    else:
-                        # Store the info in X
-                        X = np.append(X, data[userID][touchID][info])
-                    # Increment the element counter
-                    elmCount = elmCount + 1
+    # 4. Evaluate SVM accuracy on a hold-out set
+    measure_svm_accuracy(X, y)
 
-        # Close the csv file
-        file.close()
+    # 5. Train full SVM model on all data
+    h1 = svm.LinearSVC(C=1)
+    h1.fit(X, y)
 
-        # Reshape X
-        X = X.reshape(touchIDCount, TOUCH_ELEMENTS - 1)
+    # 6. Save the model
+    with open(MODEL_FILE, 'wb') as f:
+        pickle.dump(h1, f)
 
-        # Make a svm model and measure its accuracy
-        measure_svm_accuracy(X, y)
-
-        # Create the full SVM model
-        h1 = svm.LinearSVC(C=1)
-        h1.fit(X, y)
-
-        # Save the model
-        pickle.dump(h1, open(MODEL_FILE, 'wb'))
-
+    print("Model trained and saved successfully")
+    return h1
 
 
 # -------------------------------------------------------------------
+
+def check_failed_attempts(user_id, matched_bool: bool):
+    """
+    Track authentication attempts and trigger email alert if threshold is exceeded.
+    Per-user tracking:
+      - Each user_id has its own attempt history and alert cooldown.
+    A security email is sent via SendEmail once the user reaches
+    MIN_FAILED_ATTEMPTS failures within ALERT_TIME_WINDOW seconds,
+    and at least ALERT_EMAIL_COOLDOWN seconds have passed since the last alert.
+    """
+    current_time = datetime.now()
+
+    with attempts_lock:
+        # Add current attempt for THIS user
+        user_attempts[user_id].append((current_time, matched_bool))
+
+        # Remove attempts older than the time window for THIS user
+        cutoff_time = current_time - timedelta(seconds=ALERT_TIME_WINDOW)
+        user_attempts[user_id] = [
+            (timestamp, match) for timestamp, match in user_attempts[user_id]
+            if timestamp > cutoff_time
+        ]
+
+        # Count failed attempts in the time window (False = failed)
+        failed_attempts = [
+            match for timestamp, match in user_attempts[user_id]
+            if not match
+        ]
+
+        failed_count = len(failed_attempts)
+        total_attempts = len(user_attempts[user_id])
+
+        print(
+            f"User {user_id}: {failed_count} failed out of "
+            f"{total_attempts} attempts in last {ALERT_TIME_WINDOW}s"
+        )
+
+        # Check if we should send an alert email for THIS user
+        if failed_count >= MIN_FAILED_ATTEMPTS:
+            last_alert = last_alert_sent.get(user_id)
+            seconds_since_last = (
+                (current_time - last_alert).total_seconds()
+                if last_alert is not None
+                else None
+            )
+
+            if last_alert is None or seconds_since_last > ALERT_EMAIL_COOLDOWN:
+                # --- Look up the user's email from userinfo ---
+                email = None
+                try:
+                    cursor = mydb.cursor()
+                    cursor.execute(
+                        "SELECT email FROM userinfo WHERE userID = %s",
+                        (user_id,)
+                    )
+                    row = cursor.fetchone()
+                    cursor.close()
+
+                    if row and row[0]:
+                        email = row[0]
+                except Exception as e:
+                    print("[ALERT] DB error while looking up user email:", e)
+                    email = None
+
+                if email:
+                    # --- Build and send the security email via SendEmail ---
+                    try:
+                        timeS = current_time.strftime('%Y-%m-%d %H:%M:%S')
+
+                        body = (
+                            "Hello,\n\n"
+                            "We detected multiple failed biometric swipes "
+                            "associated with your TouchAlytics account.\n\n"
+                            f"Failed attempts (last {ALERT_TIME_WINDOW} seconds): {failed_count}\n"
+                            f"Time of last attempt: {timeS}\n\n"
+                            "If this wasn't you, we recommend changing your password."
+                            "— TouchAlytics Security"
+                        )
+                        SendEmail(
+                            email,
+                            body,
+                            f"TouchAlytics Security Alert - Failed Biometric Swipes - {timeS}",
+                        )
+                        print(
+                            f"[ALERT] Sent failed-attempt security email to {email} "
+                            f"for userID {user_id}"
+                        )
+                    except Exception as e:
+                        print("[ALERT] Error sending failed-attempt email:", e)
+                else:
+                    print(
+                        f"[ALERT] No email found for userID {user_id}; "
+                        "skipping alert email."
+                    )
+
+                # Update cooldown and clear attempt history for THIS user
+                last_alert_sent[user_id] = current_time
+                user_attempts[user_id] = []
+                return True
+
+        return False
+
 
 
 @app.route('/authenticate/<user_id>', methods=['POST'])
@@ -203,75 +313,88 @@ def authenticate(user_id):
     req = request.get_json()
 
     if not req:
+        print("Invalid JSON")
         return jsonify({"message": "Invalid or missing JSON body"}), 400
 
-
-    # Validate features
+    # Validate and collect features in REQUIRED_FEATURES order
     features = []
     for key in REQUIRED_FEATURES:
         if key not in req:
-            return jsonify({"message": f"Invalid features provided: missing '{key}'"}), 400
-        # Add feature to list
+            return jsonify(
+                {"message": f"Invalid features provided: missing '{key}'"},
+            ), 400
         features.append(req[key])
 
-    # Get the list of previous users
-    prevUsers = get_prev_users(USER_ID_FILE)
+    # Extract current user ID from the correct position
+    user_index = REQUIRED_FEATURES.index("userID")
+    currUser = features[user_index]
 
-    currUser = features[TOUCH_ELEMENTS-1]
+    # Cast to int so it matches how we trained the model
+    try:
+        currUser_int = int(currUser)
+    except Exception:
+        print(f"Warning: could not cast currUser={currUser} to int; using raw value")
+        currUser_int = currUser
 
-    del features[TOUCH_ELEMENTS-1]
+    # Remove userID from the feature vector
+    del features[user_index]
 
-    if len(prevUsers) == 0:
-        try:
-            # Attempt to create model
-            create_model()
-        except ValueError:
-            return jsonify({"match": "true", "message": "Matched"}), 200
+    # We NO LONGER rebuild the model here.
+    # We just require that a trained MODEL_FILE already exists.
+
+    if not os.path.exists(MODEL_FILE) or os.path.getsize(MODEL_FILE) == 0:
+        return jsonify({
+            "match": "false",
+            "message": "Model file missing or empty. Please train the model."
+        }), 503
+
+    # Load the model safely
+    try:
+        with open(MODEL_FILE, "rb") as f:
+            h1 = pickle.load(f)
+    except EOFError:
+        return jsonify({
+            "match": "false",
+            "message": "Model file is corrupted (EOF)"
+        }), 503
+    except Exception as e:
+        return jsonify({
+            "match": "false",
+            "message": f"Error loading model: {str(e)}"
+        }), 503
+
+    # Reshape the features list into a numpy array for prediction
+    x_input = np.array(features, dtype=float).reshape(1, -1)
+
+    # Predict with the loaded model
+    y_pred = h1.predict(x_input)[0]  # scalar label
+
+    matched_bool = (y_pred == currUser_int)
+    matched_str = "true" if matched_bool else "false"
+    message = "Matched" if matched_bool else "Not Matched"
+
+    # Track failed attempts using a boolean
+    check_failed_attempts(currUser_int, matched_bool)
+
+    if matched_bool:
+        # Identity verified
+        return jsonify({"match": matched_str, "message": message}), 200
     else:
-        # Check if its not a new user
-        if currUser not in prevUsers:
-            # Remake model
-            create_model()
-
-    # Load the model
-    h1 = pickle.load(open(MODEL_FILE, 'rb'))
-
-    # Reshape the features list into a numpy
-    x_input = np.array(features).reshape(1,-1)
-
-    y_pred = h1.predict(x_input)
-
-    # print(y_pred)
-
-    if y_pred == currUser:
-        matched = "true"
-        message = "Matched"
-    else:
-        matched = "false"
-        message = "Not Matched"
-
-    # print(matched,message)
-
-    return jsonify({"match": matched, "message": message}), 200
-
+        # Authentication failed
+        return jsonify({"match": matched_str, "message": message}), 400
 
 
 if __name__ == "__main__":
-    # Path to the service account key file
-    cred = credentials.Certificate("firebase_service_key.json")
-    firebase_admin.initialize_app(cred, {'databaseURL': 'https://touchalytics-fedb3-default-rtdb.firebaseio.com/'})
-
+    # Optional: still try to train on startup.
+    # Later, if you want *all* training external, you can delete this block
+    # and run create_model() from a separate script/cron instead.
     try:
         create_model()
+    except NeedMultipleUsers:
+        print("Not enough users with sufficient strokes to train model yet.")
+    except ValueError as e:
+        print(f"Could not train model on startup: {e}")
+    except Exception as e:
+        print(f"Unexpected error training model on startup: {e}")
 
-    except ImportError:
-        # Do nothing
-        print()
-    except ValueError:
-        # Do nothing
-        print()
-
-    app.run(host='0.0.0.0', port=5000, debug=True)
-
-
-
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
