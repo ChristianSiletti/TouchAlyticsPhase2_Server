@@ -1,6 +1,6 @@
-To run TouchAlytics with a MySQL backend, you first need a MySQL server running on localhost (default port 3306) and a database named touchalytics. After installing MySQL (or using an existing instance), create a dedicated MySQL user account that the Flask app will use. From the MySQL command line or a GUI like MySQL Workbench, connect as a privileged user (often root) and create the application user and database. A typical setup looks like this:
+To run TouchAlytics with a MySQL backend, you first need a MySQL server running on localhost (default port 3306) and a squema named touchalytics. After installing MySQL (or using an existing instance), create a dedicated MySQL user account that the Flask app will use. From the MySQL command line or a GUI like MySQL Workbench, connect as a privileged user (often root) and create the application user and database. A typical setup looks like this:
 
-CREATE DATABASE touchalytics CHARACTER SET utf8mb3;
+CREATE SCHEMA touchalytics;
 
 CREATE USER 'TouchAlytics'@'localhost' IDENTIFIED BY 'Touchgroup1!';
 
@@ -9,7 +9,7 @@ GRANT ALL PRIVILEGES ON touchalytics.* TO 'TouchAlytics'@'localhost';
 FLUSH PRIVILEGES;
 
 
-With the database and user created, select the touchalytics database and create the tables in the correct order. The userinfo table must be created first because the swipefeatures table has a foreign key that references userinfo.userID. Still inside MySQL with the touchalytics database selected (via USE touchalytics;), run:
+With the database and user created, select the touchalytics schema and create the tables in the correct order. The userinfo table must be created first because the swipefeatures table has a foreign key that references userinfo.userID. Still inside MySQL with the touchalytics database selected (via USE touchalytics;), run:
 
 CREATE TABLE userinfo (
   userID int NOT NULL AUTO_INCREMENT,
@@ -72,3 +72,9 @@ mydb = mysql.connector.connect(
     database="touchalytics"
 )
 mycursor = mydb.cursor()
+
+--------------------------------------------------
+
+
+Additionally, if ports need to be changed on the server side you can edit the PORT constant in auth.py (defaulted to 7000) and the port in the main (at the bottom of app.py) 
+from the defaulted 5000 to a different port. The 7000 port is used for db connections and the 5000 is used for flask.
