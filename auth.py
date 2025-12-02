@@ -3,12 +3,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import mysql.connector
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, Blueprint
+from flask import jsonify, Blueprint
 import random
-import os
-from authlib.integrations.flask_client import OAuth  # pip install flask requests authlib
-from dotenv import load_dotenv
-from datetime import datetime, timedelta
+
+from datetime import datetime
 
 import socket
 import json
