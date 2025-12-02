@@ -64,7 +64,7 @@ The following code can help clarify connections.
 
 auth = Blueprint("auth", __name__)
 
-# ------------------- MySQL setup -------------------
+------------------- MySQL setup -------------------
 mydb = mysql.connector.connect(
     host="localhost",
     user="TouchAlytics",
