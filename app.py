@@ -125,6 +125,38 @@ def load_swipe_rows_from_db():
     return rows
 
 
+# ---- NEW: shared helper to compute "eligible" users ----------------
+def get_eligible_users_and_strokes():
+    """
+    Returns:
+        (eligible_user_ids, user_to_strokes_dict)
+
+    - eligible_user_ids: list of userIDs with >= MIN_STROKES strokes
+    - user_to_strokes_dict: {userID: [row_dict, ...]}
+    """
+    rows = load_swipe_rows_from_db()
+
+    if not rows:
+        return [], {}
+
+    user_to_strokes = defaultdict(list)
+
+    for row in rows:
+        uid_raw = row["userID"]
+        try:
+            uid = int(uid_raw)
+        except Exception:
+            uid = str(uid_raw)
+        user_to_strokes[uid].append(row)
+
+    userIDlist = [
+        uid for uid, strokes in user_to_strokes.items()
+        if len(strokes) >= MIN_STROKES
+    ]
+
+    return userIDlist, user_to_strokes
+
+
 def create_model():
     """
     Build/refresh the SVM model using swipe feature rows from the DB (swipefeatures).
@@ -132,28 +164,12 @@ def create_model():
     This function no longer uses users.csv or any prev/current user tracking.
     """
 
-    # 1. Read data from the database
-    rows = load_swipe_rows_from_db()
+    # 1. Read data & compute eligible users
+    userIDlist, user_to_strokes = get_eligible_users_and_strokes()
 
-    if not rows:
+    if not user_to_strokes:
         print("No data in DB")
         raise ValueError("No data available in DB to train model.")
-
-    # 2. Group strokes by userID and enforce MIN_STROKES
-    user_to_strokes = defaultdict(list)
-
-    for row in rows:
-        # row is a dict with keys matching REQUIRED_FEATURES
-        uid_raw = row["userID"]
-        try:
-            uid = int(uid_raw)
-        except Exception:
-            uid = str(uid_raw)
-
-        user_to_strokes[uid].append(row)
-
-    userIDlist = [uid for uid, strokes in user_to_strokes.items()
-                  if len(strokes) >= MIN_STROKES]
 
     if len(userIDlist) <= 1:
         print(f"Found {len(userIDlist)} user(s) with >= {MIN_STROKES} strokes")
@@ -314,7 +330,8 @@ def authenticate(user_id):
 
     if not req:
         print("Invalid JSON")
-        return jsonify({"message": "Invalid or missing JSON body"}), 400
+
+        return jsonify({"message": "Invalid or missing JSON body"}), 500
 
     # Validate and collect features in REQUIRED_FEATURES order
     features = []
@@ -322,7 +339,7 @@ def authenticate(user_id):
         if key not in req:
             return jsonify(
                 {"message": f"Invalid features provided: missing '{key}'"},
-            ), 400
+            ), 500
         features.append(req[key])
 
     # Extract current user ID from the correct position
@@ -339,14 +356,27 @@ def authenticate(user_id):
     # Remove userID from the feature vector
     del features[user_index]
 
+    # --------- NEW: neutral behavior when only one eligible user ----------
+    eligible_users, _ = get_eligible_users_and_strokes()
+    if len(eligible_users) <= 1:
+        # "Neutral" -> no biometric decision; client should fall back to password
+        return jsonify({
+            "match": "unknown",
+            "message": (
+                "Biometric model not available: need at least two users with "
+                f">= {MIN_STROKES} strokes each."
+            ),
+        }), 500
+    # ----------------------------------------------------------------------
+
     # We NO LONGER rebuild the model here.
     # We just require that a trained MODEL_FILE already exists.
 
     if not os.path.exists(MODEL_FILE) or os.path.getsize(MODEL_FILE) == 0:
         return jsonify({
-            "match": "false",
+            "match": "unknown",
             "message": "Model file missing or empty. Please train the model."
-        }), 503
+        }), 500
 
     # Load the model safely
     try:
@@ -354,14 +384,14 @@ def authenticate(user_id):
             h1 = pickle.load(f)
     except EOFError:
         return jsonify({
-            "match": "false",
+            "match": "unknown",
             "message": "Model file is corrupted (EOF)"
-        }), 503
+        }), 500
     except Exception as e:
         return jsonify({
-            "match": "false",
+            "match": "unknown",
             "message": f"Error loading model: {str(e)}"
-        }), 503
+        }), 500
 
     # Reshape the features list into a numpy array for prediction
     x_input = np.array(features, dtype=float).reshape(1, -1)
